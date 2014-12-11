@@ -100,6 +100,44 @@ def getFontDecodeDict(font):
             working_list=nums=[]        
     return rtn
 
+#Utility function for getting the Decode Dict from a font
+def getFontDecodeDict2(font):
+    """
+                Only works for font with ToUnicode and DesendantFont...FontFile2
+                This function is a quick ugly function, may not work.
+    """    
+    # No cmap, use ToUnicode
+    print "cmap not found, using /ToUnicode for", autoDecode(font.BaseFont)
+    rtn={}    
+    tokens=PdfTokens(readStream(font.ToUnicode))
+    doRange=False
+    working_list=nums=[]    
+    for tok in tokens:        
+        if tok=='beginbfrange':
+            doRange=True            
+        elif tok=='endbfrange':
+            doRange=False            
+        elif tok[:]=='[':
+            working_list=[]            
+        elif tok[:]==']':
+            nums.append(working_array)
+            working_list=nums
+        elif tok[0]=='<' and tok[-1]=='>':                            
+            working_list.append(int(tok[1:-1],16))        
+        if doRange and len(nums)>=3:
+            start, end, target=nums[0],nums[1], nums[2]
+            if isinstance(target, list):
+                for i in range(start, end+1):
+                    rtn[i]=unichr(target[i-start])
+            else:
+                for i in range(start, end+1):
+                    rtn[i]=unichr(target+i-start)
+            working_list=nums=[]
+        elif not doRange and len(nums)>=2:            
+            rtn[nums[0]]=unichr(nums[1])
+            working_list=nums=[]        
+    return rtn
+
 #utility function: permanent id
 def _id(obj, objlist=[]):
     for i,x in enumerate(objlist):
@@ -111,7 +149,10 @@ def _id(obj, objlist=[]):
 def transPdfString(v, translator)        :
     if isinstance(v, PdfString):                    
         if v[0]=="(":
-            s0=v.decode()
+            try:
+                s0=v.decode()
+            except:
+                return None
             if s0.startswith("\xfe\xff"): #chardet.detect(s0)["encoding"]=="UTF-16BE":
                 s1=translator(s0.decode("utf-16be", "ignore"))  
                 s2=PdfString.encode(s1.encode("utf-16be"))                        
@@ -140,6 +181,7 @@ class TranslatedPdf(object):
             self.pdf=PdfReader(StringIO.StringIO(cmdout), decompress=False)
         self.decodeDicts={}
         self.font_list=[]
+        self.font_list_02=[]
         self.dttf=fontTools.ttLib.TTFont(TTF_FILE) # default ttf
         if self.dttf['cmap'].getcmap(3,1) is None:        
             cmap10=self.dttf['cmap'].getcmap(3,10).cmap
@@ -148,13 +190,16 @@ class TranslatedPdf(object):
             cmap=self.dttf['cmap'].getcmap(3,1).cmap
         self.ttf_cmap=cmap
         for n, page in enumerate(self.pdf.pages):
-            print "Translating p", n , "\r",
+            print "Translating p", n
             self._translatePage(page, translator)
         # translate fonts
         for font in self.font_list:            
             fontfile=font.DescendantFonts[0].FontDescriptor.FontFile2
             writeStream(fontfile, file(TTF_FILE,"rb").read())
             font.ToUnicode=None
+        for font in self.font_list_02:
+            font.ToUnicode=None
+            pass
         # translate info
         if self.pdf.has_key("/Info"):
             for k,v in self.pdf.Info.iteritems():
@@ -181,12 +226,19 @@ class TranslatedPdf(object):
                 font_id=_id(font)
                 if font_id not in self.decodeDicts:                    
                     if font.has_key("/ToUnicode") and font.has_key("/DescendantFonts"):
+                        print font
                         print "Font translated:",k, autoDecode(font.BaseFont)
                         self.decodeDicts[font_id]=getFontDecodeDict(font)
                         self.font_list.append(font)
+                    elif font.has_key("/ToUnicode") and font.has_key("/FirstChar") and font.has_key("/LastChar"):
+                        print font
+                        print "Font has Unicode:",k, autoDecode(font.BaseFont)
+                        #self.decodeDicts[font_id]=getFontDecodeDict2(font)
+                        self.decodeDicts[font_id]=None
+                        self.font_list_02.append(font)
                     else:
                         print "Font not translated:", k, autoDecode(font.BaseFont)
-                        self.decodeDicts[font_id]=None    
+                        self.decodeDicts[font_id]=None
                         
     def saveAs(self, fname):
         opdf=PdfWriter()
@@ -198,11 +250,14 @@ class TranslatedPdf(object):
 
     def _translatePage(self, page, translator):
         def handleText(encoded_text, decodeDict):
-            if not decodeDict: 
+            print "handleText"
+            if not decodeDict:
                 return encoded_text #unable to decode the text
-            if encoded_text[0]!='<': # Unhandled case, never happend
+            print "handleText1"
+            if encoded_text[0]!='(' and encoded_text[0]!='<': # Unhandled case, never happend
                 print encoded_text[:]
                 return encoded_text
+            print "handleText2"
             b=encoded_text.decode()
             utext0=u""
             b0=b            
@@ -210,11 +265,17 @@ class TranslatedPdf(object):
                 code = ord(b[0])*256+ord(b[1]) if len(b)>1 else ord(b[0])
                 if decodeDict.has_key(code):
                     utext0 += decodeDict[code]
+                elif decodeDict.has_key(ord(b[0])):
+                    utext0 += decodeDict[ord(b[0])]
+                    b=b[1:]
+                    continue
                 else:
                     utext0 += "??"
                     print "\n??", hex(code), [hex(ord(x)) for x in str(b0)]                    
                 b=b[2:]
-            utext=translator(utext0)                
+            print ("|"+utext0+"|").encode("utf-8")
+            utext=translator(utext0)
+            print ("["+utext+"]").encode("utf-8")
             gid_array=[]
             for x in utext:
                 try:
@@ -232,13 +293,13 @@ class TranslatedPdf(object):
         operands=[]
         decodeDict=None
         for tok in tokens:
-            if str.isalpha(tok[0]) or tok[0] in ['"', "'"]:            
+            if str.isalpha(tok[0]) or tok[0] in ['"', "'"]:
                 if tok=='Tf':
-                    font_name=operands[0]                    
+                    font_name=operands[0]
                     decodeDict=self.decodeDicts[_id(fonts[font_name])]
-                elif tok=="Tj":                    
-                    operands[0]=handleText(operands[0], decodeDict)                    
-                elif tok=="TJ":                
+                elif tok=="Tj":
+                    operands[0]=handleText(operands[0], decodeDict)
+                elif tok=="TJ":
                     for n,t in enumerate(operands[1:]):
                         if t==']':
                             break
@@ -248,7 +309,7 @@ class TranslatedPdf(object):
                             tokNum=None
                         if tokNum==None:
                             operands[n+1]=handleText(t, decodeDict)
-                output += " ".join(operands+[tok]) + "\n"            
+                output += " ".join(operands+[tok]) + "\n"
                 operands=[]            
             else:
                 operands.append(tok)    
@@ -274,7 +335,7 @@ Ignored when output file name is given""")
         if args.output is None:
             inputFileName=autoDecode(os.path.basename(args.input)) # to unicode
             args.output=autoDecode(args.output_prefix)+translator(inputFileName)    
-    print "\nwriting", args.output
+    print "\nwriting", args.output.encode("utf-8")
     tpdf.saveAs(args.output)
 if __name__ == "__main__":
     main()
